@@ -1,0 +1,6 @@
+{"ts":"2025-12-14T19:25:12.345Z","level":"INFO","msg":"request started","service":"orders","namespace":"prod","pod":"orders-api-6f4c9b7c8d-xp9k2","node":"ip-10-0-2-15","trace_id":"a1","path":"/checkout","status":200}
+{"ts":"2025-12-14T19:25:12.901Z","level":"ERROR","msg":"database timeout","service":"orders","namespace":"prod","pod":"orders-api-6f4c9b7c8d-xp9k2","trace_id":"a1","db_host":"10.0.1.8","user_email":"alice@example.com"}
+{"ts":"2025-12-14T19:25:13.001Z","level":"WARN","msg":"rate limit approaching","service":"gateway","namespace":"prod","pod":"gw-7c8d9f","trace_id":"b7","client_ip":"203.0.113.9"}
+{"ts":"2025-12-14T19:25:13.221Z","level":"INFO","message":"payment ok","app":"payments","kubernetes":{"namespace_name":"prod","pod_name":"pay-55fd","node_name":"ip-10-0-2-22"},"trace":"c9"}
+{"time":"2025-12-14T19:25:14Z","severity":"ERROR","message":"panic: nil pointer","service":"auth","namespace":"prod","pod":"auth-123","token":"Bearer abc.def.ghi"}
+{"ts":"2025-12-14T19:25:15.555Z","level":"INFO","msg":"user login","service":"auth","namespace":"prod","pod":"auth-123","user_email":"bob@example.com","phone":"+1-212-555-0199"}
