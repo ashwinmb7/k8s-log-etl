@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"k8s-log-etl/internal/stages"
 	"log"
 	"os"
 )
@@ -24,6 +25,8 @@ func main() {
 	//Create scanner to read file line by line
 	scanner := bufio.NewScanner(file)
 
+	enc := json.NewEncoder(os.Stdout)
+
 	for scanner.Scan() {
 
 		line := scanner.Text()
@@ -40,6 +43,15 @@ func main() {
 		if jsonerr != nil {
 			failedLine++
 		} else {
+			normalized, normerr := stages.Normalize(js)
+
+			if normerr != nil {
+				failedLine++
+				fmt.Fprintf(os.Stderr, "Normalization error: %v\n", normerr)
+			} else {
+				enc.Encode(normalized)
+			}
+
 			parsedLine++
 		}
 	}

@@ -1,0 +1,15 @@
+# binaries
+bin/
+*.exe
+*.out
+
+# generated outputs
+out*.jsonl
+errors*.jsonl
+report*.json
+data/
+
+# editor
+.vscode/
+.idea/
+.DS_Store

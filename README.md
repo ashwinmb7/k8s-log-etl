@@ -14,3 +14,19 @@ redacts PII, and emits clean structured logs with reports.
 ## Usage
 ```bash
 etl run --config config.yaml
+---
+
+## 7️⃣ Define the normalized schema (VERY IMPORTANT)
+In `docs/schema.md`:
+```md
+## NormalizedLog
+
+- ts (RFC3339)
+- level (DEBUG | INFO | WARN | ERROR)
+- service
+- namespace
+- pod
+- node (optional)
+- message
+- trace_id (optional)
+- fields (map of remaining attributes)
