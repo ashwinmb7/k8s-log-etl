@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"k8s-log-etl/internal/report"
 	"k8s-log-etl/internal/stages"
 	"log"
 	"os"
@@ -15,6 +16,8 @@ func main() {
 	var parsedLine int
 
 	file, err := os.Open("examples/k8s_logs.jsonl")
+
+	rep := report.NewReport()
 
 	if err != nil {
 		log.Fatal(err)
@@ -60,5 +63,10 @@ func main() {
 		log.Fatal(err)
 	}
 
+	if err := rep.WriteJSON("report.json"); err != nil {
+		log.Fatal(err)
+	}
+
 	fmt.Printf("Total Lines: %d, Parsed Lines: %d, Failed Lines: %d\n", totalLine, parsedLine, failedLine)
+
 }
