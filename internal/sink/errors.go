@@ -1,3 +1,8 @@
 ﻿package sink
 
-// Placeholder for sink-specific errors.
+type ErrorRecord struct {
+	Line  int    `json:"line"`
+	Error string `json:"error"`
+	Stage string `json:"stage"`
+	Raw   string `json:"raw"`
+}
