@@ -8,16 +8,12 @@ import (
 	"k8s-log-etl/internal/stages"
 	"log"
 	"os"
+	"strings"
 )
 
 func main() {
-	var totalLine int
-	var failedLine int
-	var parsedLine int
-
-	file, err := os.Open("examples/k8s_logs.jsonl")
-
 	rep := report.NewReport()
+	file, err := os.Open("examples/k8s_logs.jsonl")
 
 	if err != nil {
 		log.Fatal(err)
@@ -38,24 +34,34 @@ func main() {
 			continue
 		}
 
-		totalLine++
+		rep.TotalLines++
 
 		var js map[string]interface{}
 		jsonerr := json.Unmarshal([]byte(line), &js)
 
 		if jsonerr != nil {
-			failedLine++
+			rep.JSONFailed++
 		} else {
+			rep.JSONParsed++
 			normalized, normerr := stages.Normalize(js)
 
 			if normerr != nil {
-				failedLine++
+				rep.NormalizedFailed++
 				fmt.Fprintf(os.Stderr, "Normalization error: %v\n", normerr)
 			} else {
-				enc.Encode(normalized)
-			}
+				rep.NormalizedOK++
+				rep.AddLevel(normalized.Level)
+				rep.AddService(normalized.Service)
 
-			parsedLine++
+				level := strings.ToUpper(normalized.Level)
+				if level == "WARN" || level == "ERROR" {
+					if err := enc.Encode(normalized); err != nil {
+						fmt.Fprintf(os.Stderr, "write output error: %v\n", err)
+					} else {
+						rep.WrittenOK++
+					}
+				}
+			}
 		}
 	}
 
@@ -67,6 +73,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("Total Lines: %d, Parsed Lines: %d, Failed Lines: %d\n", totalLine, parsedLine, failedLine)
+	fmt.Printf(
+		"Total Lines: %d, JSON Parsed: %d, JSON Failed: %d, Normalized OK: %d, Normalized Failed: %d, Written OK: %d\n",
+		rep.TotalLines,
+		rep.JSONParsed,
+		rep.JSONFailed,
+		rep.NormalizedOK,
+		rep.NormalizedFailed,
+		rep.WrittenOK,
+	)
 
 }
