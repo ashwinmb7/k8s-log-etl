@@ -18,7 +18,7 @@ func TestFilterAllowsLevelAndRedacts(t *testing.T) {
 		Fields: map[string]any{"user_email": "a", "token": "b", "keep": "ok"},
 	}
 
-	if !stage.Apply(&rec) {
+	if ok, _ := stage.Apply(&rec); !ok {
 		t.Fatalf("expected record to pass filter")
 	}
 
@@ -44,7 +44,7 @@ func TestFilterBlocksLevelWithoutRedaction(t *testing.T) {
 		Fields: map[string]any{"user_email": "a", "other": "b"},
 	}
 
-	if stage.Apply(&rec) {
+	if ok, _ := stage.Apply(&rec); ok {
 		t.Fatalf("expected record to be blocked by level filter")
 	}
 	if rec.Fields["user_email"] != "a" || rec.Fields["other"] != "b" {
@@ -58,12 +58,12 @@ func TestFilterByServiceCaseInsensitive(t *testing.T) {
 	})
 
 	recBlocked := model.Normalized{Service: "orders"}
-	if stage.Apply(&recBlocked) {
+	if ok, _ := stage.Apply(&recBlocked); ok {
 		t.Fatalf("expected orders service to be blocked")
 	}
 
 	recAllowed := model.Normalized{Service: "PAYMENTS"}
-	if !stage.Apply(&recAllowed) {
+	if ok, _ := stage.Apply(&recAllowed); !ok {
 		t.Fatalf("expected payments service to be allowed")
 	}
 }
@@ -71,7 +71,7 @@ func TestFilterByServiceCaseInsensitive(t *testing.T) {
 func TestFilterAllowsWhenNoRules(t *testing.T) {
 	stage := NewFilterStage(config.Config{})
 	rec := model.Normalized{Level: "debug", Service: "any"}
-	if !stage.Apply(&rec) {
+	if ok, _ := stage.Apply(&rec); !ok {
 		t.Fatalf("expected record to pass when no filters configured")
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -94,6 +95,7 @@ func main() {
 	rep := report.NewReport()
 	scanner := bufio.NewScanner(in)
 	filterStage := stages.NewFilterStage(cfg)
+	start := time.Now()
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -121,12 +123,14 @@ func main() {
 		rep.AddLevel(normalized.Level)
 		rep.AddService(normalized.Service)
 
-		if !filterStage.Apply(&normalized) {
+		if ok, reason := filterStage.Apply(&normalized); !ok {
+			rep.AddFiltered(reason)
 			continue
 		}
 
 		if err := writeWithRetry(sinkWriter, normalized); err != nil {
 			fmt.Fprintf(os.Stderr, "write output error: %v\n", err)
+			rep.WriteFailed++
 			continue
 		}
 		rep.WrittenOK++
@@ -136,6 +140,7 @@ func main() {
 		log.Fatal(err)
 	}
 
+	rep.SetDuration(time.Since(start))
 	if err := rep.WriteJSON(cfg.ReportPath); err != nil {
 		log.Fatal(err)
 	}

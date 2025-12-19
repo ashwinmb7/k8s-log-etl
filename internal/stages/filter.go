@@ -25,12 +25,13 @@ func NewFilterStage(cfg config.Config) *FilterStage {
 }
 
 // Apply returns true when the record should be written, mutating Fields for redaction.
-func (f *FilterStage) Apply(n *model.Normalized) bool {
+// If false, the reason is returned (e.g., "level" or "service").
+func (f *FilterStage) Apply(n *model.Normalized) (bool, string) {
 	if len(f.levels) > 0 && !containsUpper(f.levels, n.Level) {
-		return false
+		return false, "level"
 	}
 	if len(f.services) > 0 && !containsLower(f.services, n.Service) {
-		return false
+		return false, "service"
 	}
 
 	if len(f.redact) > 0 && len(n.Fields) > 0 {
@@ -38,7 +39,7 @@ func (f *FilterStage) Apply(n *model.Normalized) bool {
 			delete(n.Fields, key)
 		}
 	}
-	return true
+	return true, ""
 }
 
 func buildUpperSet(values []string) map[string]struct{} {
