@@ -18,6 +18,7 @@ type Config struct {
 	OutputPath   string   `json:"output,omitempty" yaml:"output,omitempty"`
 	ReportPath   string   `json:"report,omitempty" yaml:"report,omitempty"`
 	FilterLevels []string `json:"filter_levels,omitempty" yaml:"filter_levels,omitempty"`
+	FilterSvcs   []string `json:"filter_services,omitempty" yaml:"filter_services,omitempty"`
 	RedactKeys   []string `json:"redact_keys,omitempty" yaml:"redact_keys,omitempty"`
 }
 
@@ -47,6 +48,9 @@ func Merge(base, override Config) Config {
 	if len(override.FilterLevels) > 0 {
 		result.FilterLevels = override.FilterLevels
 	}
+	if len(override.FilterSvcs) > 0 {
+		result.FilterSvcs = override.FilterSvcs
+	}
 	if len(override.RedactKeys) > 0 {
 		result.RedactKeys = override.RedactKeys
 	}
@@ -69,6 +73,9 @@ func FromEnv(base Config) Config {
 	}
 	if v := os.Getenv("ETL_FILTER_LEVELS"); v != "" {
 		result.FilterLevels = parseList(v)
+	}
+	if v := os.Getenv("ETL_FILTER_SERVICES"); v != "" {
+		result.FilterSvcs = parseList(v)
 	}
 	if v := os.Getenv("ETL_REDACT_KEYS"); v != "" {
 		result.RedactKeys = parseList(v)

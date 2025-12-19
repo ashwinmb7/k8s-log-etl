@@ -21,6 +21,7 @@ func main() {
 	flagOutput := flag.String("output", "", "output path (use '-' for stdout)")
 	flagReport := flag.String("report", "", "report output path")
 	flagFilterLevels := flag.String("filter-levels", "", "comma-separated levels to emit (e.g. WARN,ERROR)")
+	flagFilterServices := flag.String("filter-services", "", "comma-separated services to emit (case-insensitive)")
 	flagRedactKeys := flag.String("redact-keys", "", "comma-separated field keys to redact from extra fields")
 	flag.Parse()
 
@@ -56,6 +57,9 @@ func main() {
 	if *flagFilterLevels != "" {
 		override.FilterLevels = parseList(*flagFilterLevels)
 	}
+	if *flagFilterServices != "" {
+		override.FilterSvcs = parseList(*flagFilterServices)
+	}
 	if *flagRedactKeys != "" {
 		override.RedactKeys = parseList(*flagRedactKeys)
 	}
@@ -77,8 +81,7 @@ func main() {
 	rep := report.NewReport()
 	scanner := bufio.NewScanner(in)
 	enc := json.NewEncoder(out)
-	filterLevels := buildLevelSet(cfg.FilterLevels)
-	redactSet := buildRedactSet(cfg.RedactKeys)
+	filterStage := stages.NewFilterStage(cfg)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -106,18 +109,14 @@ func main() {
 		rep.AddLevel(normalized.Level)
 		rep.AddService(normalized.Service)
 
-		if len(redactSet) > 0 && len(normalized.Fields) > 0 {
-			for key := range redactSet {
-				delete(normalized.Fields, key)
-			}
+		if !filterStage.Apply(&normalized) {
+			continue
 		}
 
-		if shouldWrite(normalized.Level, filterLevels) {
-			if err := enc.Encode(normalized); err != nil {
-				fmt.Fprintf(os.Stderr, "write output error: %v\n", err)
-			} else {
-				rep.WrittenOK++
-			}
+		if err := enc.Encode(normalized); err != nil {
+			fmt.Fprintf(os.Stderr, "write output error: %v\n", err)
+		} else {
+			rep.WrittenOK++
 		}
 	}
 
@@ -152,36 +151,6 @@ func openOutput(path string) (io.WriteCloser, error) {
 		return nopWriteCloser{w: os.Stdout}, nil
 	}
 	return os.Create(path)
-}
-
-func buildLevelSet(levels []string) map[string]struct{} {
-	set := make(map[string]struct{}, len(levels))
-	for _, l := range levels {
-		if l == "" {
-			continue
-		}
-		set[strings.ToUpper(l)] = struct{}{}
-	}
-	return set
-}
-
-func buildRedactSet(keys []string) map[string]struct{} {
-	set := make(map[string]struct{}, len(keys))
-	for _, k := range keys {
-		if k == "" {
-			continue
-		}
-		set[k] = struct{}{}
-	}
-	return set
-}
-
-func shouldWrite(level string, allowed map[string]struct{}) bool {
-	if len(allowed) == 0 {
-		return true
-	}
-	_, ok := allowed[strings.ToUpper(level)]
-	return ok
 }
 
 // parseList is a small helper for comma/semicolon-separated values.
