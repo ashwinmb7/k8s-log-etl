@@ -8,6 +8,7 @@ import (
 	"io"
 	"k8s-log-etl/internal/config"
 	"k8s-log-etl/internal/report"
+	"k8s-log-etl/internal/sink"
 	"k8s-log-etl/internal/stages"
 	"log"
 	"os"
@@ -19,6 +20,9 @@ func main() {
 	flagConfig := flag.String("config", "", "path to YAML or JSON config file")
 	flagInput := flag.String("input", "", "input JSONL path (use '-' for stdin)")
 	flagOutput := flag.String("output", "", "output path (use '-' for stdout)")
+	flagOutputType := flag.String("output-type", "", "sink type: stdout|file|rotate (default stdout)")
+	flagOutputMaxBytes := flag.Int64("output-max-bytes", 0, "max bytes before rotation when using rotate sink")
+	flagOutputMaxFiles := flag.Int("output-max-files", 0, "max rotated files to keep when using rotate sink")
 	flagReport := flag.String("report", "", "report output path")
 	flagFilterLevels := flag.String("filter-levels", "", "comma-separated levels to emit (e.g. WARN,ERROR)")
 	flagFilterServices := flag.String("filter-services", "", "comma-separated services to emit (case-insensitive)")
@@ -51,6 +55,15 @@ func main() {
 	if *flagOutput != "" {
 		override.OutputPath = *flagOutput
 	}
+	if *flagOutputType != "" {
+		override.OutputType = *flagOutputType
+	}
+	if *flagOutputMaxBytes != 0 {
+		override.OutputMaxB = *flagOutputMaxBytes
+	}
+	if *flagOutputMaxFiles != 0 {
+		override.OutputMaxFiles = *flagOutputMaxFiles
+	}
 	if *flagReport != "" {
 		override.ReportPath = *flagReport
 	}
@@ -72,15 +85,14 @@ func main() {
 	}
 	defer in.Close()
 
-	out, err := openOutput(cfg.OutputPath)
+	sinkWriter, err := sink.Build(cfg)
 	if err != nil {
-		log.Fatalf("open output: %v", err)
+		log.Fatalf("open sink: %v", err)
 	}
-	defer out.Close()
+	defer sinkWriter.Close()
 
 	rep := report.NewReport()
 	scanner := bufio.NewScanner(in)
-	enc := json.NewEncoder(out)
 	filterStage := stages.NewFilterStage(cfg)
 
 	for scanner.Scan() {
@@ -113,11 +125,11 @@ func main() {
 			continue
 		}
 
-		if err := enc.Encode(normalized); err != nil {
+		if err := writeWithRetry(sinkWriter, normalized); err != nil {
 			fmt.Fprintf(os.Stderr, "write output error: %v\n", err)
-		} else {
-			rep.WrittenOK++
+			continue
 		}
+		rep.WrittenOK++
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -146,13 +158,6 @@ func openInput(path string) (io.ReadCloser, error) {
 	return os.Open(path)
 }
 
-func openOutput(path string) (io.WriteCloser, error) {
-	if path == "" || path == "-" {
-		return nopWriteCloser{w: os.Stdout}, nil
-	}
-	return os.Create(path)
-}
-
 // parseList is a small helper for comma/semicolon-separated values.
 func parseList(s string) []string {
 	parts := strings.FieldsFunc(s, func(r rune) bool {
@@ -167,13 +172,13 @@ func parseList(s string) []string {
 	return out
 }
 
-// nopWriteCloser wraps an io.Writer to satisfy io.WriteCloser.
-type nopWriteCloser struct {
-	w io.Writer
+func writeWithRetry(w sink.Writer, record any) error {
+	if err := w.Write(record); err != nil {
+		// retry once
+		if err2 := w.Write(record); err2 != nil {
+			return err2
+		}
+		return nil
+	}
+	return nil
 }
-
-func (n nopWriteCloser) Write(p []byte) (int, error) {
-	return n.w.Write(p)
-}
-
-func (n nopWriteCloser) Close() error { return nil }

@@ -14,21 +14,27 @@ import (
 
 // Config holds ETL runtime options.
 type Config struct {
-	InputPath    string   `json:"input,omitempty" yaml:"input,omitempty"`
-	OutputPath   string   `json:"output,omitempty" yaml:"output,omitempty"`
-	ReportPath   string   `json:"report,omitempty" yaml:"report,omitempty"`
-	FilterLevels []string `json:"filter_levels,omitempty" yaml:"filter_levels,omitempty"`
-	FilterSvcs   []string `json:"filter_services,omitempty" yaml:"filter_services,omitempty"`
-	RedactKeys   []string `json:"redact_keys,omitempty" yaml:"redact_keys,omitempty"`
+	InputPath      string   `json:"input,omitempty" yaml:"input,omitempty"`
+	OutputPath     string   `json:"output,omitempty" yaml:"output,omitempty"`
+	ReportPath     string   `json:"report,omitempty" yaml:"report,omitempty"`
+	OutputType     string   `json:"output_type,omitempty" yaml:"output_type,omitempty"` // stdout|file|rotate
+	OutputMaxB     int64    `json:"output_max_bytes,omitempty" yaml:"output_max_bytes,omitempty"`
+	OutputMaxFiles int      `json:"output_max_files,omitempty" yaml:"output_max_files,omitempty"`
+	FilterLevels   []string `json:"filter_levels,omitempty" yaml:"filter_levels,omitempty"`
+	FilterSvcs     []string `json:"filter_services,omitempty" yaml:"filter_services,omitempty"`
+	RedactKeys     []string `json:"redact_keys,omitempty" yaml:"redact_keys,omitempty"`
 }
 
 // Default returns a Config with sensible defaults.
 func Default() Config {
 	return Config{
 		// Maintain legacy behavior of reading bundled sample logs.
-		InputPath:    "examples/k8s_logs.jsonl",
-		ReportPath:   "report.json",
-		FilterLevels: []string{"WARN", "ERROR"},
+		InputPath:      "examples/k8s_logs.jsonl",
+		ReportPath:     "report.json",
+		OutputType:     "stdout",
+		OutputMaxB:     10 * 1024 * 1024, // 10 MiB default rotation threshold
+		OutputMaxFiles: 5,
+		FilterLevels:   []string{"WARN", "ERROR"},
 	}
 }
 
@@ -41,6 +47,15 @@ func Merge(base, override Config) Config {
 	}
 	if override.OutputPath != "" {
 		result.OutputPath = override.OutputPath
+	}
+	if override.OutputType != "" {
+		result.OutputType = override.OutputType
+	}
+	if override.OutputMaxB != 0 {
+		result.OutputMaxB = override.OutputMaxB
+	}
+	if override.OutputMaxFiles != 0 {
+		result.OutputMaxFiles = override.OutputMaxFiles
 	}
 	if override.ReportPath != "" {
 		result.ReportPath = override.ReportPath
@@ -67,6 +82,19 @@ func FromEnv(base Config) Config {
 	}
 	if v := os.Getenv("ETL_OUTPUT"); v != "" {
 		result.OutputPath = v
+	}
+	if v := os.Getenv("ETL_OUTPUT_TYPE"); v != "" {
+		result.OutputType = v
+	}
+	if v := os.Getenv("ETL_OUTPUT_MAX_BYTES"); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			result.OutputMaxB = parsed
+		}
+	}
+	if v := os.Getenv("ETL_OUTPUT_MAX_FILES"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			result.OutputMaxFiles = parsed
+		}
 	}
 	if v := os.Getenv("ETL_REPORT"); v != "" {
 		result.ReportPath = v
