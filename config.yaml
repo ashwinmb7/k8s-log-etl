@@ -1,0 +1,13 @@
+input: examples/k8s_logs.jsonl
+output: "-"
+report: report.json
+output_type: stdout
+filter_levels:
+  - WARN
+  - ERROR
+filter_services:
+  - orders
+  - payments
+redact_keys:
+  - user_email
+  - token

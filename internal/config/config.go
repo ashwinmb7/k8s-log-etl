@@ -14,27 +14,40 @@ import (
 
 // Config holds ETL runtime options.
 type Config struct {
-	InputPath      string   `json:"input,omitempty" yaml:"input,omitempty"`
-	OutputPath     string   `json:"output,omitempty" yaml:"output,omitempty"`
-	ReportPath     string   `json:"report,omitempty" yaml:"report,omitempty"`
-	OutputType     string   `json:"output_type,omitempty" yaml:"output_type,omitempty"` // stdout|file|rotate
-	OutputMaxB     int64    `json:"output_max_bytes,omitempty" yaml:"output_max_bytes,omitempty"`
-	OutputMaxFiles int      `json:"output_max_files,omitempty" yaml:"output_max_files,omitempty"`
-	FilterLevels   []string `json:"filter_levels,omitempty" yaml:"filter_levels,omitempty"`
-	FilterSvcs     []string `json:"filter_services,omitempty" yaml:"filter_services,omitempty"`
-	RedactKeys     []string `json:"redact_keys,omitempty" yaml:"redact_keys,omitempty"`
+	InputPath         string   `json:"input,omitempty" yaml:"input,omitempty"`
+	OutputPath        string   `json:"output,omitempty" yaml:"output,omitempty"`
+	ReportPath        string   `json:"report,omitempty" yaml:"report,omitempty"`
+	OutputType        string   `json:"output_type,omitempty" yaml:"output_type,omitempty"` // stdout|file|rotate
+	OutputMaxB        int64    `json:"output_max_bytes,omitempty" yaml:"output_max_bytes,omitempty"`
+	OutputMaxFiles    int      `json:"output_max_files,omitempty" yaml:"output_max_files,omitempty"`
+	FilterLevels      []string `json:"filter_levels,omitempty" yaml:"filter_levels,omitempty"`
+	FilterSvcs        []string `json:"filter_services,omitempty" yaml:"filter_services,omitempty"`
+	RedactKeys        []string `json:"redact_keys,omitempty" yaml:"redact_keys,omitempty"`
+	MaxWorkers        int      `json:"max_workers,omitempty" yaml:"max_workers,omitempty"`
+	QueueSize         int      `json:"queue_size,omitempty" yaml:"queue_size,omitempty"`
+	SinkMaxRetries    int      `json:"sink_max_retries,omitempty" yaml:"sink_max_retries,omitempty"`
+	SinkBackoffBaseMS int      `json:"sink_backoff_base_ms,omitempty" yaml:"sink_backoff_base_ms,omitempty"`
+	SinkBackoffMaxMS  int      `json:"sink_backoff_max_ms,omitempty" yaml:"sink_backoff_max_ms,omitempty"`
+	SinkBackoffJitter float64  `json:"sink_backoff_jitter_pct,omitempty" yaml:"sink_backoff_jitter_pct,omitempty"`
+	DLQPath           string   `json:"dlq,omitempty" yaml:"dlq,omitempty"`
 }
 
 // Default returns a Config with sensible defaults.
 func Default() Config {
 	return Config{
 		// Maintain legacy behavior of reading bundled sample logs.
-		InputPath:      "examples/k8s_logs.jsonl",
-		ReportPath:     "report.json",
-		OutputType:     "stdout",
-		OutputMaxB:     10 * 1024 * 1024, // 10 MiB default rotation threshold
-		OutputMaxFiles: 5,
-		FilterLevels:   []string{"WARN", "ERROR"},
+		InputPath:         "examples/k8s_logs.jsonl",
+		ReportPath:        "report.json",
+		OutputType:        "stdout",
+		OutputMaxB:        10 * 1024 * 1024, // 10 MiB default rotation threshold
+		OutputMaxFiles:    5,
+		FilterLevels:      []string{"WARN", "ERROR"},
+		MaxWorkers:        4,
+		QueueSize:         128,
+		SinkMaxRetries:    3,
+		SinkBackoffBaseMS: 100,
+		SinkBackoffMaxMS:  2000,
+		SinkBackoffJitter: 0.2,
 	}
 }
 
@@ -69,6 +82,27 @@ func Merge(base, override Config) Config {
 	if len(override.RedactKeys) > 0 {
 		result.RedactKeys = override.RedactKeys
 	}
+	if override.MaxWorkers > 0 {
+		result.MaxWorkers = override.MaxWorkers
+	}
+	if override.QueueSize > 0 {
+		result.QueueSize = override.QueueSize
+	}
+	if override.SinkMaxRetries > 0 {
+		result.SinkMaxRetries = override.SinkMaxRetries
+	}
+	if override.SinkBackoffBaseMS > 0 {
+		result.SinkBackoffBaseMS = override.SinkBackoffBaseMS
+	}
+	if override.SinkBackoffMaxMS > 0 {
+		result.SinkBackoffMaxMS = override.SinkBackoffMaxMS
+	}
+	if override.SinkBackoffJitter > 0 {
+		result.SinkBackoffJitter = override.SinkBackoffJitter
+	}
+	if override.DLQPath != "" {
+		result.DLQPath = override.DLQPath
+	}
 
 	return result
 }
@@ -95,6 +129,39 @@ func FromEnv(base Config) Config {
 		if parsed, err := strconv.Atoi(v); err == nil {
 			result.OutputMaxFiles = parsed
 		}
+	}
+	if v := os.Getenv("ETL_MAX_WORKERS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			result.MaxWorkers = parsed
+		}
+	}
+	if v := os.Getenv("ETL_QUEUE_SIZE"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			result.QueueSize = parsed
+		}
+	}
+	if v := os.Getenv("ETL_SINK_MAX_RETRIES"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			result.SinkMaxRetries = parsed
+		}
+	}
+	if v := os.Getenv("ETL_SINK_BACKOFF_BASE_MS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			result.SinkBackoffBaseMS = parsed
+		}
+	}
+	if v := os.Getenv("ETL_SINK_BACKOFF_MAX_MS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			result.SinkBackoffMaxMS = parsed
+		}
+	}
+	if v := os.Getenv("ETL_SINK_BACKOFF_JITTER_PCT"); v != "" {
+		if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+			result.SinkBackoffJitter = parsed
+		}
+	}
+	if v := os.Getenv("ETL_DLQ"); v != "" {
+		result.DLQPath = v
 	}
 	if v := os.Getenv("ETL_REPORT"); v != "" {
 		result.ReportPath = v

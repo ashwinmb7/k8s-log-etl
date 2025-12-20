@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,11 +22,13 @@ type Report struct {
 	ByLevel          map[string]int `json:"by_level"`
 	ByService        map[string]int `json:"by_service"`
 	Filtered         FilterStats    `json:"filtered"`
+	DLQWritten       int            `json:"dlq_written"`
 	DurationSeconds  float64        `json:"duration_seconds"`
 	Throughput       float64        `json:"throughput_lines_per_sec"`
 	JSONErrorRate    float64        `json:"json_error_rate"`
 	NormalizeErrRate float64        `json:"normalize_error_rate"`
 	WriteErrorRate   float64        `json:"write_error_rate"`
+	mu               sync.Mutex     `json:"-"`
 }
 
 type FilterStats struct {
@@ -44,6 +47,8 @@ func NewReport() *Report {
 
 // AddLevel increments the count for a log level.
 func (r *Report) AddLevel(level string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if level == "" {
 		return
 	}
@@ -52,6 +57,8 @@ func (r *Report) AddLevel(level string) {
 
 // AddService increments the count for a service.
 func (r *Report) AddService(service string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if service == "" {
 		return
 	}
@@ -60,6 +67,8 @@ func (r *Report) AddService(service string) {
 
 // AddFiltered increments filter stats by reason.
 func (r *Report) AddFiltered(reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	switch reason {
 	case "level":
 		r.Filtered.Level++
@@ -70,8 +79,34 @@ func (r *Report) AddFiltered(reason string) {
 	}
 }
 
+// AddWriteOK increments successful writes.
+func (r *Report) AddWriteOK() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.WrittenOK++
+}
+
+// AddWriteFailed increments failed writes.
+func (r *Report) AddWriteFailed() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.WriteFailed++
+}
+
+// AddDLQ increments DLQ count.
+func (r *Report) AddDLQ() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.DLQWritten++
+}
+
 // SetDuration computes derived metrics based on runtime.
 func (r *Report) SetDuration(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if d <= 0 && r.TotalLines > 0 {
+		d = time.Nanosecond
+	}
 	r.DurationSeconds = d.Seconds()
 	if d.Seconds() > 0 {
 		r.Throughput = float64(r.TotalLines) / d.Seconds()
@@ -121,6 +156,7 @@ func (r *Report) Prometheus() string {
 	fmt.Fprintf(sb, "etl_normalized_failed %d\n", r.NormalizedFailed)
 	fmt.Fprintf(sb, "etl_written_ok %d\n", r.WrittenOK)
 	fmt.Fprintf(sb, "etl_written_failed %d\n", r.WriteFailed)
+	fmt.Fprintf(sb, "etl_dlq_written %d\n", r.DLQWritten)
 	fmt.Fprintf(sb, "etl_duration_seconds %.6f\n", r.DurationSeconds)
 	fmt.Fprintf(sb, "etl_throughput_lines_per_sec %.6f\n", r.Throughput)
 	fmt.Fprintf(sb, "etl_json_error_rate %.6f\n", r.JSONErrorRate)

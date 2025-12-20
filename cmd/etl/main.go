@@ -7,12 +7,16 @@ import (
 	"fmt"
 	"io"
 	"k8s-log-etl/internal/config"
+	"k8s-log-etl/internal/model"
 	"k8s-log-etl/internal/report"
 	"k8s-log-etl/internal/sink"
 	"k8s-log-etl/internal/stages"
 	"log"
+	"math/rand"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,6 +29,13 @@ func main() {
 	flagOutputMaxBytes := flag.Int64("output-max-bytes", 0, "max bytes before rotation when using rotate sink")
 	flagOutputMaxFiles := flag.Int("output-max-files", 0, "max rotated files to keep when using rotate sink")
 	flagReport := flag.String("report", "", "report output path")
+	flagMaxWorkers := flag.Int("max-workers", 0, "number of sink workers")
+	flagQueueSize := flag.Int("queue-size", 0, "bounded queue size between normalize and sink")
+	flagSinkRetries := flag.Int("sink-max-retries", 0, "max retries for sink writes")
+	flagBackoffBase := flag.Int("sink-backoff-base-ms", 0, "base backoff in ms for sink retries")
+	flagBackoffMax := flag.Int("sink-backoff-max-ms", 0, "max backoff in ms for sink retries")
+	flagBackoffJitter := flag.Float64("sink-backoff-jitter-pct", 0, "jitter pct (0.2 = 20%) for sink retries")
+	flagDLQ := flag.String("dlq", "", "dead-letter path for failed records (jsonl). 's3://...' not supported.")
 	flagFilterLevels := flag.String("filter-levels", "", "comma-separated levels to emit (e.g. WARN,ERROR)")
 	flagFilterServices := flag.String("filter-services", "", "comma-separated services to emit (case-insensitive)")
 	flagRedactKeys := flag.String("redact-keys", "", "comma-separated field keys to redact from extra fields")
@@ -68,6 +79,27 @@ func main() {
 	if *flagReport != "" {
 		override.ReportPath = *flagReport
 	}
+	if *flagMaxWorkers != 0 {
+		override.MaxWorkers = *flagMaxWorkers
+	}
+	if *flagQueueSize != 0 {
+		override.QueueSize = *flagQueueSize
+	}
+	if *flagSinkRetries != 0 {
+		override.SinkMaxRetries = *flagSinkRetries
+	}
+	if *flagBackoffBase != 0 {
+		override.SinkBackoffBaseMS = *flagBackoffBase
+	}
+	if *flagBackoffMax != 0 {
+		override.SinkBackoffMaxMS = *flagBackoffMax
+	}
+	if *flagBackoffJitter != 0 {
+		override.SinkBackoffJitter = *flagBackoffJitter
+	}
+	if *flagDLQ != "" {
+		override.DLQPath = *flagDLQ
+	}
 	if *flagFilterLevels != "" {
 		override.FilterLevels = parseList(*flagFilterLevels)
 	}
@@ -91,11 +123,53 @@ func main() {
 		log.Fatalf("open sink: %v", err)
 	}
 	defer sinkWriter.Close()
+	lockedSink := &lockedWriter{w: sinkWriter}
+
+	var dlqWriter *lockedWriter
+	if cfg.DLQPath != "" {
+		dlq, err := openDLQ(cfg.DLQPath)
+		if err != nil {
+			log.Fatalf("open dlq: %v", err)
+		}
+		dlqWriter = &lockedWriter{w: dlq}
+		defer dlqWriter.Close()
+	}
 
 	rep := report.NewReport()
 	scanner := bufio.NewScanner(in)
 	filterStage := stages.NewFilterStage(cfg)
 	start := time.Now()
+
+	workerCount := cfg.MaxWorkers
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	queueSize := cfg.QueueSize
+	if queueSize <= 0 {
+		queueSize = 128
+	}
+
+	queue := make(chan workItem, queueSize)
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	rand.Seed(time.Now().UnixNano())
+
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer wg.Done()
+			for item := range queue {
+				if err := writeWithRetry(lockedSink, item.record, cfg); err != nil {
+					rep.AddWriteFailed()
+					if dlqWriter != nil {
+						_ = dlqWriter.Write(dlqRecord{Record: item.record, Reason: err.Error()})
+						rep.AddDLQ()
+					}
+					continue
+				}
+				rep.AddWriteOK()
+			}
+		}()
+	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -128,17 +202,15 @@ func main() {
 			continue
 		}
 
-		if err := writeWithRetry(sinkWriter, normalized); err != nil {
-			fmt.Fprintf(os.Stderr, "write output error: %v\n", err)
-			rep.WriteFailed++
-			continue
-		}
-		rep.WrittenOK++
+		queue <- workItem{record: normalized}
 	}
 
 	if err := scanner.Err(); err != nil {
 		log.Fatal(err)
 	}
+
+	close(queue)
+	wg.Wait()
 
 	rep.SetDuration(time.Since(start))
 	if err := rep.WriteJSON(cfg.ReportPath); err != nil {
@@ -177,13 +249,80 @@ func parseList(s string) []string {
 	return out
 }
 
-func writeWithRetry(w sink.Writer, record any) error {
-	if err := w.Write(record); err != nil {
-		// retry once
-		if err2 := w.Write(record); err2 != nil {
-			return err2
-		}
-		return nil
+type workItem struct {
+	record model.Normalized
+}
+
+type dlqRecord struct {
+	Record model.Normalized `json:"record"`
+	Reason string           `json:"reason"`
+}
+
+func writeWithRetry(w sink.Writer, record any, cfg config.Config) error {
+	maxRetries := cfg.SinkMaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
 	}
-	return nil
+	base := time.Duration(cfg.SinkBackoffBaseMS) * time.Millisecond
+	if base <= 0 {
+		base = 100 * time.Millisecond
+	}
+	max := time.Duration(cfg.SinkBackoffMaxMS) * time.Millisecond
+	if max <= 0 {
+		max = 2 * time.Second
+	}
+	jitterPct := cfg.SinkBackoffJitter
+	if jitterPct <= 0 {
+		jitterPct = 0.2
+	}
+
+	var err error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err = w.Write(record); err == nil {
+			return nil
+		}
+
+		if attempt == maxRetries {
+			break
+		}
+
+		sleep := base << attempt
+		if sleep > max {
+			sleep = max
+		}
+		jitter := time.Duration(rand.Float64() * float64(sleep) * jitterPct)
+		time.Sleep(sleep + jitter)
+	}
+	return err
+}
+
+type lockedWriter struct {
+	mu sync.Mutex
+	w  sink.Writer
+}
+
+func (l *lockedWriter) Write(record any) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(record)
+}
+
+func (l *lockedWriter) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Close()
+}
+
+func openDLQ(path string) (sink.Writer, error) {
+	if strings.HasPrefix(path, "s3://") {
+		return nil, fmt.Errorf("DLQ s3 target not supported in this build: %s", path)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	return sink.NewJSONLSink(f), nil
 }
