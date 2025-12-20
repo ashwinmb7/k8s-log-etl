@@ -23,6 +23,7 @@ type Config struct {
 	FilterLevels      []string `json:"filter_levels,omitempty" yaml:"filter_levels,omitempty"`
 	FilterSvcs        []string `json:"filter_services,omitempty" yaml:"filter_services,omitempty"`
 	RedactKeys        []string `json:"redact_keys,omitempty" yaml:"redact_keys,omitempty"`
+	Transforms        []string `json:"transforms,omitempty" yaml:"transforms,omitempty"`
 	MaxWorkers        int      `json:"max_workers,omitempty" yaml:"max_workers,omitempty"`
 	QueueSize         int      `json:"queue_size,omitempty" yaml:"queue_size,omitempty"`
 	SinkMaxRetries    int      `json:"sink_max_retries,omitempty" yaml:"sink_max_retries,omitempty"`
@@ -42,6 +43,7 @@ func Default() Config {
 		OutputMaxB:        10 * 1024 * 1024, // 10 MiB default rotation threshold
 		OutputMaxFiles:    5,
 		FilterLevels:      []string{"WARN", "ERROR"},
+		Transforms:        []string{"filter_redact"},
 		MaxWorkers:        4,
 		QueueSize:         128,
 		SinkMaxRetries:    3,
@@ -81,6 +83,9 @@ func Merge(base, override Config) Config {
 	}
 	if len(override.RedactKeys) > 0 {
 		result.RedactKeys = override.RedactKeys
+	}
+	if len(override.Transforms) > 0 {
+		result.Transforms = override.Transforms
 	}
 	if override.MaxWorkers > 0 {
 		result.MaxWorkers = override.MaxWorkers
@@ -174,6 +179,9 @@ func FromEnv(base Config) Config {
 	}
 	if v := os.Getenv("ETL_REDACT_KEYS"); v != "" {
 		result.RedactKeys = parseList(v)
+	}
+	if v := os.Getenv("ETL_TRANSFORMS"); v != "" {
+		result.Transforms = parseList(v)
 	}
 
 	return result

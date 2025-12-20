@@ -18,8 +18,8 @@ func TestFilterAllowsLevelAndRedacts(t *testing.T) {
 		Fields: map[string]any{"user_email": "a", "token": "b", "keep": "ok"},
 	}
 
-	if ok, _ := stage.Apply(&rec); !ok {
-		t.Fatalf("expected record to pass filter")
+	if ok, reason := stage.Apply(&rec); !ok {
+		t.Fatalf("expected record to pass filter, reason=%s", reason)
 	}
 
 	if _, ok := rec.Fields["user_email"]; ok {
@@ -44,8 +44,8 @@ func TestFilterBlocksLevelWithoutRedaction(t *testing.T) {
 		Fields: map[string]any{"user_email": "a", "other": "b"},
 	}
 
-	if ok, _ := stage.Apply(&rec); ok {
-		t.Fatalf("expected record to be blocked by level filter")
+	if ok, reason := stage.Apply(&rec); ok {
+		t.Fatalf("expected record to be blocked by level filter, reason=%s", reason)
 	}
 	if rec.Fields["user_email"] != "a" || rec.Fields["other"] != "b" {
 		t.Fatalf("expected fields to remain untouched when blocked")
@@ -71,7 +71,7 @@ func TestFilterByServiceCaseInsensitive(t *testing.T) {
 func TestFilterAllowsWhenNoRules(t *testing.T) {
 	stage := NewFilterStage(config.Config{})
 	rec := model.Normalized{Level: "debug", Service: "any"}
-	if ok, _ := stage.Apply(&rec); !ok {
-		t.Fatalf("expected record to pass when no filters configured")
+	if ok, reason := stage.Apply(&rec); !ok {
+		t.Fatalf("expected record to pass when no filters configured, reason=%s", reason)
 	}
 }

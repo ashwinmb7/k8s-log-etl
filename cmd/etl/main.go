@@ -8,6 +8,7 @@ import (
 	"io"
 	"k8s-log-etl/internal/config"
 	"k8s-log-etl/internal/model"
+	"k8s-log-etl/internal/plugins"
 	"k8s-log-etl/internal/report"
 	"k8s-log-etl/internal/sink"
 	"k8s-log-etl/internal/stages"
@@ -111,16 +112,38 @@ func main() {
 	}
 	cfg = config.Merge(cfg, override)
 
-	// Prepare IO based on config.
-	in, err := openInput(cfg.InputPath)
+	rep := report.NewReport()
+	in, closeFn, err := inputReader(cfg.InputPath)
 	if err != nil {
 		log.Fatalf("open input: %v", err)
 	}
-	defer in.Close()
+	if closeFn != nil {
+		defer closeFn()
+	}
 
+	if err := runPipeline(in, cfg, rep); err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf(
+		"Total Lines: %d, JSON Parsed: %d, JSON Failed: %d, Normalized OK: %d, Normalized Failed: %d, Written OK: %d\n",
+		rep.TotalLines,
+		rep.JSONParsed,
+		rep.JSONFailed,
+		rep.NormalizedOK,
+		rep.NormalizedFailed,
+		rep.WrittenOK,
+	)
+}
+
+func runPipeline(in io.Reader, cfg config.Config, rep *report.Report) error {
+	transforms, err := plugins.BuildTransforms(cfg)
+	if err != nil {
+		return fmt.Errorf("load transforms: %w", err)
+	}
 	sinkWriter, err := sink.Build(cfg)
 	if err != nil {
-		log.Fatalf("open sink: %v", err)
+		return fmt.Errorf("open sink: %w", err)
 	}
 	defer sinkWriter.Close()
 	lockedSink := &lockedWriter{w: sinkWriter}
@@ -129,16 +152,14 @@ func main() {
 	if cfg.DLQPath != "" {
 		dlq, err := openDLQ(cfg.DLQPath)
 		if err != nil {
-			log.Fatalf("open dlq: %v", err)
+			return fmt.Errorf("open dlq: %w", err)
 		}
 		dlqWriter = &lockedWriter{w: dlq}
 		defer dlqWriter.Close()
 	}
 
-	rep := report.NewReport()
-	scanner := bufio.NewScanner(in)
-	filterStage := stages.NewFilterStage(cfg)
 	start := time.Now()
+	scanner := bufio.NewScanner(in)
 
 	workerCount := cfg.MaxWorkers
 	if workerCount <= 0 {
@@ -197,8 +218,23 @@ func main() {
 		rep.AddLevel(normalized.Level)
 		rep.AddService(normalized.Service)
 
-		if ok, reason := filterStage.Apply(&normalized); !ok {
-			rep.AddFiltered(reason)
+		skipped := false
+		for _, tf := range transforms {
+			nn, drop, reason, err := tf(normalized)
+			if err != nil {
+				rep.NormalizedFailed++
+				fmt.Fprintf(os.Stderr, "Transform error: %v\n", err)
+				skipped = true
+				break
+			}
+			if drop {
+				rep.AddFiltered(reason)
+				skipped = true
+				break
+			}
+			normalized = nn
+		}
+		if skipped {
 			continue
 		}
 
@@ -206,7 +242,7 @@ func main() {
 	}
 
 	if err := scanner.Err(); err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	close(queue)
@@ -214,25 +250,10 @@ func main() {
 
 	rep.SetDuration(time.Since(start))
 	if err := rep.WriteJSON(cfg.ReportPath); err != nil {
-		log.Fatal(err)
+		return err
 	}
 
-	fmt.Printf(
-		"Total Lines: %d, JSON Parsed: %d, JSON Failed: %d, Normalized OK: %d, Normalized Failed: %d, Written OK: %d\n",
-		rep.TotalLines,
-		rep.JSONParsed,
-		rep.JSONFailed,
-		rep.NormalizedOK,
-		rep.NormalizedFailed,
-		rep.WrittenOK,
-	)
-}
-
-func openInput(path string) (io.ReadCloser, error) {
-	if path == "" || path == "-" {
-		return io.NopCloser(os.Stdin), nil
-	}
-	return os.Open(path)
+	return nil
 }
 
 // parseList is a small helper for comma/semicolon-separated values.
@@ -325,4 +346,15 @@ func openDLQ(path string) (sink.Writer, error) {
 		return nil, err
 	}
 	return sink.NewJSONLSink(f), nil
+}
+
+func inputReader(path string) (io.Reader, func(), error) {
+	if path == "" || path == "-" {
+		return os.Stdin, nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, func() { f.Close() }, nil
 }
