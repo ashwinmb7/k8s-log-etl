@@ -1,15 +1,18 @@
 package sink
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"k8s-log-etl/internal/config"
 )
 
 // Build constructs a sink based on config.
-func Build(cfg config.Config) (Writer, error) {
+func Build(ctx context.Context, cfg config.Config) (Writer, error) {
 	switch strings.ToLower(cfg.OutputType) {
 	case "", "stdout":
 		return NewJSONLSink(nopCloser{os.Stdout}), nil
@@ -35,6 +38,17 @@ func Build(cfg config.Config) (Writer, error) {
 			maxFiles = 5
 		}
 		return NewRotatingJSONLSink(cfg.OutputPath, maxBytes, maxFiles)
+	case "http", "webhook":
+		if cfg.OutputPath == "" {
+			return nil, fmt.Errorf("%w: output URL required for http sink", ErrOpenSink)
+		}
+		return NewHTTPSink(ctx, cfg.OutputPath, cfg.SinkMaxRetries, time.Duration(cfg.SinkBackoffBaseMS)*time.Millisecond)
+	case "s3":
+		// S3 sink would require AWS SDK - placeholder for now
+		return nil, fmt.Errorf("%w: S3 sink not yet implemented (requires AWS SDK)", ErrOpenSink)
+	case "kafka":
+		// Kafka sink would require Kafka client - placeholder for now
+		return nil, fmt.Errorf("%w: Kafka sink not yet implemented (requires Kafka client library)", ErrOpenSink)
 	default:
 		return nil, fmt.Errorf("%w: unknown output type %q", ErrOpenSink, cfg.OutputType)
 	}

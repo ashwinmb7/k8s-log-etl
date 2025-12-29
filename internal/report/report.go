@@ -28,7 +28,13 @@ type Report struct {
 	JSONErrorRate    float64        `json:"json_error_rate"`
 	NormalizeErrRate float64        `json:"normalize_error_rate"`
 	WriteErrorRate   float64        `json:"write_error_rate"`
-	mu               sync.Mutex     `json:"-"`
+	// Per-stage timings in seconds
+	StageTimings StageTimings `json:"stage_timings"`
+	// Retry statistics
+	RetryStats RetryStats `json:"retry_stats"`
+	// DLQ reasons breakdown
+	DLQReasons map[string]int `json:"dlq_reasons"`
+	mu         sync.Mutex     `json:"-"`
 }
 
 type FilterStats struct {
@@ -37,11 +43,27 @@ type FilterStats struct {
 	Other   int `json:"other"`
 }
 
+// StageTimings tracks time spent in each pipeline stage.
+type StageTimings struct {
+	ParsingSeconds      float64 `json:"parsing_seconds"`
+	NormalizationSeconds float64 `json:"normalization_seconds"`
+	FilteringSeconds    float64 `json:"filtering_seconds"`
+	WritingSeconds      float64 `json:"writing_seconds"`
+}
+
+// RetryStats tracks retry attempts for sink writes.
+type RetryStats struct {
+	TotalRetries      int `json:"total_retries"`
+	WritesWithRetries int `json:"writes_with_retries"`
+	MaxRetriesPerWrite int `json:"max_retries_per_write"`
+}
+
 // NewReport initializes a Report with maps ready to use.
 func NewReport() *Report {
 	return &Report{
 		ByLevel:   make(map[string]int),
 		ByService: make(map[string]int),
+		DLQReasons: make(map[string]int),
 	}
 }
 
@@ -98,6 +120,47 @@ func (r *Report) AddDLQ() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.DLQWritten++
+}
+
+// AddDLQWithReason increments DLQ count and tracks the reason.
+func (r *Report) AddDLQWithReason(reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.DLQWritten++
+	if reason == "" {
+		reason = "unknown"
+	}
+	r.DLQReasons[reason]++
+}
+
+// AddRetry increments retry statistics.
+func (r *Report) AddRetry(retries int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.RetryStats.TotalRetries += retries
+	if retries > 0 {
+		r.RetryStats.WritesWithRetries++
+		if retries > r.RetryStats.MaxRetriesPerWrite {
+			r.RetryStats.MaxRetriesPerWrite = retries
+		}
+	}
+}
+
+// AddStageTiming adds time to a specific stage.
+func (r *Report) AddStageTiming(stage string, duration time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	seconds := duration.Seconds()
+	switch stage {
+	case "parsing":
+		r.StageTimings.ParsingSeconds += seconds
+	case "normalization":
+		r.StageTimings.NormalizationSeconds += seconds
+	case "filtering":
+		r.StageTimings.FilteringSeconds += seconds
+	case "writing":
+		r.StageTimings.WritingSeconds += seconds
+	}
 }
 
 // SetDuration computes derived metrics based on runtime.
@@ -170,6 +233,16 @@ func (r *Report) Prometheus() string {
 	}
 	for k, v := range r.ByService {
 		fmt.Fprintf(sb, "etl_service_total{service=%q} %d\n", k, v)
+	}
+	fmt.Fprintf(sb, "etl_stage_timing_seconds{stage=\"parsing\"} %.6f\n", r.StageTimings.ParsingSeconds)
+	fmt.Fprintf(sb, "etl_stage_timing_seconds{stage=\"normalization\"} %.6f\n", r.StageTimings.NormalizationSeconds)
+	fmt.Fprintf(sb, "etl_stage_timing_seconds{stage=\"filtering\"} %.6f\n", r.StageTimings.FilteringSeconds)
+	fmt.Fprintf(sb, "etl_stage_timing_seconds{stage=\"writing\"} %.6f\n", r.StageTimings.WritingSeconds)
+	fmt.Fprintf(sb, "etl_retry_total %d\n", r.RetryStats.TotalRetries)
+	fmt.Fprintf(sb, "etl_retry_writes_with_retries %d\n", r.RetryStats.WritesWithRetries)
+	fmt.Fprintf(sb, "etl_retry_max_per_write %d\n", r.RetryStats.MaxRetriesPerWrite)
+	for reason, count := range r.DLQReasons {
+		fmt.Fprintf(sb, "etl_dlq_reason_total{reason=%q} %d\n", reason, count)
 	}
 	return sb.String()
 }

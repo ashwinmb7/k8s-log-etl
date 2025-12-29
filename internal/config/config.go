@@ -31,6 +31,14 @@ type Config struct {
 	SinkBackoffMaxMS  int      `json:"sink_backoff_max_ms,omitempty" yaml:"sink_backoff_max_ms,omitempty"`
 	SinkBackoffJitter float64  `json:"sink_backoff_jitter_pct,omitempty" yaml:"sink_backoff_jitter_pct,omitempty"`
 	DLQPath           string   `json:"dlq,omitempty" yaml:"dlq,omitempty"`
+	// Batching configuration
+	BatchSize         int      `json:"batch_size,omitempty" yaml:"batch_size,omitempty"`
+	BatchFlushInterval int      `json:"batch_flush_interval_ms,omitempty" yaml:"batch_flush_interval_ms,omitempty"`
+	// Shutdown configuration
+	ShutdownTimeoutSeconds int `json:"shutdown_timeout_seconds,omitempty" yaml:"shutdown_timeout_seconds,omitempty"`
+	// Logging configuration
+	LogLevel            string `json:"log_level,omitempty" yaml:"log_level,omitempty"` // debug, info, warn, error
+	LogFormat           string `json:"log_format,omitempty" yaml:"log_format,omitempty"` // json, text
 }
 
 // Default returns a Config with sensible defaults.
@@ -50,6 +58,11 @@ func Default() Config {
 		SinkBackoffBaseMS: 100,
 		SinkBackoffMaxMS:  2000,
 		SinkBackoffJitter: 0.2,
+		BatchSize:         100,
+		BatchFlushInterval: 1000, // 1 second
+		ShutdownTimeoutSeconds: 30,
+		LogLevel:           "info",
+		LogFormat:          "json",
 	}
 }
 
@@ -107,6 +120,21 @@ func Merge(base, override Config) Config {
 	}
 	if override.DLQPath != "" {
 		result.DLQPath = override.DLQPath
+	}
+	if override.BatchSize > 0 {
+		result.BatchSize = override.BatchSize
+	}
+	if override.BatchFlushInterval > 0 {
+		result.BatchFlushInterval = override.BatchFlushInterval
+	}
+	if override.ShutdownTimeoutSeconds > 0 {
+		result.ShutdownTimeoutSeconds = override.ShutdownTimeoutSeconds
+	}
+	if override.LogLevel != "" {
+		result.LogLevel = override.LogLevel
+	}
+	if override.LogFormat != "" {
+		result.LogFormat = override.LogFormat
 	}
 
 	return result
@@ -182,6 +210,27 @@ func FromEnv(base Config) Config {
 	}
 	if v := os.Getenv("ETL_TRANSFORMS"); v != "" {
 		result.Transforms = parseList(v)
+	}
+	if v := os.Getenv("ETL_BATCH_SIZE"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			result.BatchSize = parsed
+		}
+	}
+	if v := os.Getenv("ETL_BATCH_FLUSH_INTERVAL_MS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			result.BatchFlushInterval = parsed
+		}
+	}
+	if v := os.Getenv("ETL_SHUTDOWN_TIMEOUT_SECONDS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			result.ShutdownTimeoutSeconds = parsed
+		}
+	}
+	if v := os.Getenv("ETL_LOG_LEVEL"); v != "" {
+		result.LogLevel = v
+	}
+	if v := os.Getenv("ETL_LOG_FORMAT"); v != "" {
+		result.LogFormat = v
 	}
 
 	return result
@@ -306,4 +355,97 @@ func splitLines(data []byte) []string {
 		lines = append(lines, scanner.Text())
 	}
 	return lines
+}
+
+// Validate checks the configuration for common misconfigurations and returns
+// an error describing all issues found.
+func Validate(cfg Config) error {
+	var errs []string
+
+	// Validate output type
+	if cfg.OutputType != "" && cfg.OutputType != "stdout" && cfg.OutputType != "file" && cfg.OutputType != "rotate" && cfg.OutputType != "rotating" {
+		errs = append(errs, fmt.Sprintf("invalid output_type %q: must be stdout, file, or rotate", cfg.OutputType))
+	}
+
+	// Validate output path requirements
+	if (cfg.OutputType == "file" || cfg.OutputType == "rotate" || cfg.OutputType == "rotating") && cfg.OutputPath == "" {
+		errs = append(errs, "output_path is required when output_type is file or rotate")
+	}
+
+	// Validate numeric limits (must be non-negative)
+	if cfg.MaxWorkers < 0 {
+		errs = append(errs, fmt.Sprintf("max_workers cannot be negative: %d", cfg.MaxWorkers))
+	}
+	if cfg.QueueSize < 0 {
+		errs = append(errs, fmt.Sprintf("queue_size cannot be negative: %d", cfg.QueueSize))
+	}
+	if cfg.SinkMaxRetries < 0 {
+		errs = append(errs, fmt.Sprintf("sink_max_retries cannot be negative: %d", cfg.SinkMaxRetries))
+	}
+	if cfg.SinkBackoffBaseMS < 0 {
+		errs = append(errs, fmt.Sprintf("sink_backoff_base_ms cannot be negative: %d", cfg.SinkBackoffBaseMS))
+	}
+	if cfg.SinkBackoffMaxMS < 0 {
+		errs = append(errs, fmt.Sprintf("sink_backoff_max_ms cannot be negative: %d", cfg.SinkBackoffMaxMS))
+	}
+	if cfg.SinkBackoffJitter < 0 {
+		errs = append(errs, fmt.Sprintf("sink_backoff_jitter_pct cannot be negative: %.2f", cfg.SinkBackoffJitter))
+	}
+	if cfg.OutputMaxB < 0 {
+		errs = append(errs, fmt.Sprintf("output_max_bytes cannot be negative: %d", cfg.OutputMaxB))
+	}
+	if cfg.OutputMaxFiles < 0 {
+		errs = append(errs, fmt.Sprintf("output_max_files cannot be negative: %d", cfg.OutputMaxFiles))
+	}
+
+	// Validate DLQ path
+	if cfg.DLQPath != "" {
+		if strings.HasPrefix(cfg.DLQPath, "s3://") {
+			errs = append(errs, fmt.Sprintf("DLQ path with s3:// scheme is not supported: %s", cfg.DLQPath))
+		}
+		// Check if DLQ path is empty after trimming
+		if strings.TrimSpace(cfg.DLQPath) == "" {
+			errs = append(errs, "DLQ path cannot be empty or whitespace-only")
+		}
+	}
+
+	// Validate backoff configuration consistency
+	if cfg.SinkBackoffMaxMS > 0 && cfg.SinkBackoffBaseMS > 0 && cfg.SinkBackoffMaxMS < cfg.SinkBackoffBaseMS {
+		errs = append(errs, fmt.Sprintf("sink_backoff_max_ms (%d) must be >= sink_backoff_base_ms (%d)", cfg.SinkBackoffMaxMS, cfg.SinkBackoffBaseMS))
+	}
+
+	// Validate jitter percentage
+	if cfg.SinkBackoffJitter > 1.0 {
+		errs = append(errs, fmt.Sprintf("sink_backoff_jitter_pct should be between 0.0 and 1.0, got: %.2f", cfg.SinkBackoffJitter))
+	}
+
+	// Validate batching configuration
+	if cfg.BatchSize < 0 {
+		errs = append(errs, fmt.Sprintf("batch_size cannot be negative: %d", cfg.BatchSize))
+	}
+	if cfg.BatchFlushInterval < 0 {
+		errs = append(errs, fmt.Sprintf("batch_flush_interval_ms cannot be negative: %d", cfg.BatchFlushInterval))
+	}
+
+	// Validate shutdown timeout
+	if cfg.ShutdownTimeoutSeconds < 0 {
+		errs = append(errs, fmt.Sprintf("shutdown_timeout_seconds cannot be negative: %d", cfg.ShutdownTimeoutSeconds))
+	}
+
+	// Validate log level
+	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
+	if cfg.LogLevel != "" && !validLogLevels[strings.ToLower(cfg.LogLevel)] {
+		errs = append(errs, fmt.Sprintf("invalid log_level %q: must be debug, info, warn, or error", cfg.LogLevel))
+	}
+
+	// Validate log format
+	validLogFormats := map[string]bool{"json": true, "text": true}
+	if cfg.LogFormat != "" && !validLogFormats[strings.ToLower(cfg.LogFormat)] {
+		errs = append(errs, fmt.Sprintf("invalid log_format %q: must be json or text", cfg.LogFormat))
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("configuration validation failed:\n  - %s", strings.Join(errs, "\n  - "))
+	}
+	return nil
 }

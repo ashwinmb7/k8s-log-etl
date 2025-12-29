@@ -14,7 +14,8 @@
   Type: string. Optional. Primary key `service`; accepts alias `app`.
 
 - **Kubernetes metadata (`kubernetes` block or top-level keys)**  
-  - `namespace` (`namespace_name` inside `kubernetes`, or top-level `namespace`) – string. Not hard-required by validation.  
+  - `namespace` (`namespace_name` inside `kubernetes`, or 
+  top-level `namespace`) – string. Not hard-required by validation.  
   - `pod` (`pod_name` inside `kubernetes`, or top-level `pod`) – string. Not hard-required by validation.  
   - `node` (`node_name` inside `kubernetes`, or top-level `node`) – string. Optional per schema note.
 

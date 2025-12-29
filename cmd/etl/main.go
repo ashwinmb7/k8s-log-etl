@@ -2,22 +2,26 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"k8s-log-etl/internal/config"
+	"k8s-log-etl/internal/logger"
 	"k8s-log-etl/internal/model"
 	"k8s-log-etl/internal/plugins"
 	"k8s-log-etl/internal/report"
 	"k8s-log-etl/internal/sink"
 	"k8s-log-etl/internal/stages"
-	"log"
+	"log/slog"
 	"math/rand"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -40,6 +44,11 @@ func main() {
 	flagFilterLevels := flag.String("filter-levels", "", "comma-separated levels to emit (e.g. WARN,ERROR)")
 	flagFilterServices := flag.String("filter-services", "", "comma-separated services to emit (case-insensitive)")
 	flagRedactKeys := flag.String("redact-keys", "", "comma-separated field keys to redact from extra fields")
+	flagBatchSize := flag.Int("batch-size", 0, "batch size for sink writes (0 = no batching)")
+	flagBatchFlushInterval := flag.Int("batch-flush-interval-ms", 0, "batch flush interval in milliseconds")
+	flagShutdownTimeout := flag.Int("shutdown-timeout-seconds", 0, "graceful shutdown timeout in seconds")
+	flagLogLevel := flag.String("log-level", "", "log level: debug, info, warn, error")
+	flagLogFormat := flag.String("log-format", "", "log format: json, text")
 	flag.Parse()
 
 	cfg := config.Default()
@@ -110,7 +119,34 @@ func main() {
 	if *flagRedactKeys != "" {
 		override.RedactKeys = parseList(*flagRedactKeys)
 	}
+	if *flagBatchSize != 0 {
+		override.BatchSize = *flagBatchSize
+	}
+	if *flagBatchFlushInterval != 0 {
+		override.BatchFlushInterval = *flagBatchFlushInterval
+	}
+	if *flagShutdownTimeout != 0 {
+		override.ShutdownTimeoutSeconds = *flagShutdownTimeout
+	}
+	if *flagLogLevel != "" {
+		override.LogLevel = *flagLogLevel
+	}
+	if *flagLogFormat != "" {
+		override.LogFormat = *flagLogFormat
+	}
 	cfg = config.Merge(cfg, override)
+
+	// Validate configuration before proceeding
+	if err := config.Validate(cfg); err != nil {
+		log.Fatalf("configuration validation failed: %v", err)
+	}
+
+	// Initialize structured logging
+	initLogger(cfg)
+
+	// Create context with signal handling for graceful shutdown
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
 	rep := report.NewReport()
 	in, closeFn, err := inputReader(cfg.InputPath)
@@ -121,8 +157,10 @@ func main() {
 		defer closeFn()
 	}
 
-	if err := runPipeline(in, cfg, rep); err != nil {
-		log.Fatal(err)
+	// Run pipeline with context for graceful shutdown
+	if err := runPipeline(ctx, in, cfg, rep); err != nil {
+		logger.ErrorContext(ctx, "pipeline failed", "error", err)
+		os.Exit(1)
 	}
 
 	fmt.Printf(
@@ -134,19 +172,99 @@ func main() {
 		rep.NormalizedFailed,
 		rep.WrittenOK,
 	)
+
+	// Print operational metrics
+	if rep.StageTimings.ParsingSeconds > 0 || rep.StageTimings.NormalizationSeconds > 0 || rep.StageTimings.FilteringSeconds > 0 || rep.StageTimings.WritingSeconds > 0 {
+		fmt.Printf(
+			"Stage Timings (seconds): Parsing: %.3f, Normalization: %.3f, Filtering: %.3f, Writing: %.3f\n",
+			rep.StageTimings.ParsingSeconds,
+			rep.StageTimings.NormalizationSeconds,
+			rep.StageTimings.FilteringSeconds,
+			rep.StageTimings.WritingSeconds,
+		)
+	}
+
+	if rep.RetryStats.TotalRetries > 0 {
+		fmt.Printf(
+			"Retry Stats: Total Retries: %d, Writes with Retries: %d, Max Retries per Write: %d\n",
+			rep.RetryStats.TotalRetries,
+			rep.RetryStats.WritesWithRetries,
+			rep.RetryStats.MaxRetriesPerWrite,
+		)
+	}
+
+	if rep.DLQWritten > 0 {
+		fmt.Printf("DLQ Written: %d", rep.DLQWritten)
+		if len(rep.DLQReasons) > 0 {
+			fmt.Print(" (Reasons: ")
+			reasons := make([]string, 0, len(rep.DLQReasons))
+			for reason, count := range rep.DLQReasons {
+				reasons = append(reasons, fmt.Sprintf("%s=%d", reason, count))
+			}
+			fmt.Print(strings.Join(reasons, ", "))
+			fmt.Print(")")
+		}
+		fmt.Println()
+	}
 }
 
-func runPipeline(in io.Reader, cfg config.Config, rep *report.Report) error {
+func initLogger(cfg config.Config) {
+	// Set log format
+	if strings.ToLower(cfg.LogFormat) == "text" {
+		logger.SetTextLogger()
+	}
+
+	// Set log level
+	var level slog.Level
+	switch strings.ToLower(cfg.LogLevel) {
+	case "debug":
+		level = slog.LevelDebug
+	case "info":
+		level = slog.LevelInfo
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+	logger.SetLevel(level)
+}
+
+func runPipeline(ctx context.Context, in io.Reader, cfg config.Config, rep *report.Report) error {
+	logger.InfoContext(ctx, "starting pipeline", "workers", cfg.MaxWorkers, "queue_size", cfg.QueueSize)
 	transforms, err := plugins.BuildTransforms(cfg)
 	if err != nil {
 		return fmt.Errorf("load transforms: %w", err)
 	}
-	sinkWriter, err := sink.Build(cfg)
+	
+	// Build sink with batching support
+	sinkWriter, err := sink.Build(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("open sink: %w", err)
 	}
-	defer sinkWriter.Close()
-	lockedSink := &lockedWriter{w: sinkWriter}
+	defer func() {
+		if err := sinkWriter.Close(); err != nil {
+			logger.ErrorContext(ctx, "error closing sink", "error", err)
+		}
+	}()
+	
+	// Wrap sink with batching if configured
+	var finalSink sink.Writer = sinkWriter
+	if cfg.BatchSize > 1 {
+		batchedSink, err := sink.NewBatchedSink(sinkWriter, cfg.BatchSize, time.Duration(cfg.BatchFlushInterval)*time.Millisecond)
+		if err != nil {
+			return fmt.Errorf("create batched sink: %w", err)
+		}
+		finalSink = batchedSink
+		defer func() {
+			if err := batchedSink.Close(); err != nil {
+				logger.ErrorContext(ctx, "error closing batched sink", "error", err)
+			}
+		}()
+	}
+	
+	lockedSink := &lockedWriter{w: finalSink}
 
 	var dlqWriter *lockedWriter
 	if cfg.DLQPath != "" {
@@ -155,7 +273,11 @@ func runPipeline(in io.Reader, cfg config.Config, rep *report.Report) error {
 			return fmt.Errorf("open dlq: %w", err)
 		}
 		dlqWriter = &lockedWriter{w: dlq}
-		defer dlqWriter.Close()
+		defer func() {
+			if err := dlqWriter.Close(); err != nil {
+				logger.ErrorContext(ctx, "error closing DLQ", "error", err)
+			}
+		}()
 	}
 
 	start := time.Now()
@@ -175,42 +297,89 @@ func runPipeline(in io.Reader, cfg config.Config, rep *report.Report) error {
 	wg.Add(workerCount)
 	rand.Seed(time.Now().UnixNano())
 
+	// Start workers with context-aware shutdown
 	for i := 0; i < workerCount; i++ {
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
-			for item := range queue {
-				if err := writeWithRetry(lockedSink, item.record, cfg); err != nil {
-					rep.AddWriteFailed()
-					if dlqWriter != nil {
-						_ = dlqWriter.Write(dlqRecord{Record: item.record, Reason: err.Error()})
-						rep.AddDLQ()
+			for {
+				select {
+				case <-ctx.Done():
+					logger.DebugContext(ctx, "worker shutting down", "worker_id", workerID)
+					return
+				case item, ok := <-queue:
+					if !ok {
+						return
 					}
-					continue
+					writeStart := time.Now()
+					retries, err := writeWithRetry(ctx, lockedSink, item.record, cfg, rep)
+					rep.AddStageTiming("writing", time.Since(writeStart))
+					if err != nil {
+						rep.AddWriteFailed()
+						logger.WarnContext(ctx, "write failed", "error", err, "retries", retries)
+						if dlqWriter != nil {
+							reason := err.Error()
+							if writeErr := dlqWriter.Write(dlqRecord{Record: item.record, Reason: reason}); writeErr != nil {
+								logger.ErrorContext(ctx, "failed to write to DLQ", "error", writeErr)
+							}
+							rep.AddDLQWithReason(reason)
+						}
+						continue
+					}
+					rep.AddWriteOK()
+					if retries > 0 {
+						logger.DebugContext(ctx, "write succeeded after retries", "retries", retries)
+					}
 				}
-				rep.AddWriteOK()
 			}
-		}()
+		}(i)
 	}
 
+	// Main processing loop with context cancellation
+	lineNum := 0
+	shutdownRequested := false
 	for scanner.Scan() {
+		// Check for shutdown signal
+		select {
+		case <-ctx.Done():
+			logger.InfoContext(ctx, "shutdown signal received, finishing in-flight records")
+			shutdownRequested = true
+		default:
+		}
+		
+		if shutdownRequested {
+			break
+		}
+
 		line := scanner.Text()
 		if len(strings.TrimSpace(line)) == 0 {
 			continue
 		}
 
+		lineNum++
 		rep.TotalLines++
+		
+		// Create context with trace ID for this record
+		recordCtx := context.WithValue(ctx, "trace_id", fmt.Sprintf("line-%d", lineNum))
 
+		// Track parsing time
+		parseStart := time.Now()
 		var js map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &js); err != nil {
 			rep.JSONFailed++
+			rep.AddStageTiming("parsing", time.Since(parseStart))
+			logger.DebugContext(recordCtx, "JSON parse failed", "error", err, "line", lineNum)
 			continue
 		}
-
+		rep.AddStageTiming("parsing", time.Since(parseStart))
 		rep.JSONParsed++
+
+		// Track normalization time
+		normStart := time.Now()
 		normalized, normerr := stages.Normalize(js)
+		rep.AddStageTiming("normalization", time.Since(normStart))
 		if normerr != nil {
 			rep.NormalizedFailed++
-			fmt.Fprintf(os.Stderr, "Normalization error: %v\n", normerr)
+			logger.WarnContext(recordCtx, "normalization failed", "error", normerr, "line", lineNum)
 			continue
 		}
 
@@ -218,12 +387,14 @@ func runPipeline(in io.Reader, cfg config.Config, rep *report.Report) error {
 		rep.AddLevel(normalized.Level)
 		rep.AddService(normalized.Service)
 
+		// Track filtering time
+		filterStart := time.Now()
 		skipped := false
 		for _, tf := range transforms {
 			nn, drop, reason, err := tf(normalized)
 			if err != nil {
 				rep.NormalizedFailed++
-				fmt.Fprintf(os.Stderr, "Transform error: %v\n", err)
+				logger.WarnContext(recordCtx, "transform error", "error", err, "line", lineNum)
 				skipped = true
 				break
 			}
@@ -234,6 +405,7 @@ func runPipeline(in io.Reader, cfg config.Config, rep *report.Report) error {
 			}
 			normalized = nn
 		}
+		rep.AddStageTiming("filtering", time.Since(filterStart))
 		if skipped {
 			continue
 		}
@@ -242,15 +414,41 @@ func runPipeline(in io.Reader, cfg config.Config, rep *report.Report) error {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return err
+		return fmt.Errorf("scanner error: %w", err)
 	}
 
+	// Close queue and wait for workers with timeout
+	logger.InfoContext(ctx, "input exhausted, waiting for workers to finish")
 	close(queue)
-	wg.Wait()
+	
+	// Wait for workers with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	
+	shutdownTimeout := time.Duration(cfg.ShutdownTimeoutSeconds) * time.Second
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = 30 * time.Second
+	}
+	
+	select {
+	case <-done:
+		logger.InfoContext(ctx, "all workers finished")
+	case <-time.After(shutdownTimeout):
+		logger.WarnContext(ctx, "shutdown timeout exceeded, some records may not have been processed", "timeout", shutdownTimeout)
+		return fmt.Errorf("shutdown timeout exceeded after %v", shutdownTimeout)
+	case <-ctx.Done():
+		logger.WarnContext(ctx, "context cancelled during shutdown wait")
+		return ctx.Err()
+	}
 
 	rep.SetDuration(time.Since(start))
+	logger.InfoContext(ctx, "pipeline completed", "duration_seconds", rep.DurationSeconds, "throughput", rep.Throughput)
+	
 	if err := rep.WriteJSON(cfg.ReportPath); err != nil {
-		return err
+		return fmt.Errorf("write report: %w", err)
 	}
 
 	return nil
@@ -279,7 +477,7 @@ type dlqRecord struct {
 	Reason string           `json:"reason"`
 }
 
-func writeWithRetry(w sink.Writer, record any, cfg config.Config) error {
+func writeWithRetry(ctx context.Context, w sink.Writer, record any, cfg config.Config, rep *report.Report) (int, error) {
 	maxRetries := cfg.SinkMaxRetries
 	if maxRetries < 0 {
 		maxRetries = 0
@@ -298,23 +496,44 @@ func writeWithRetry(w sink.Writer, record any, cfg config.Config) error {
 	}
 
 	var err error
+	retries := 0
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return retries, ctx.Err()
+		default:
+		}
+		
 		if err = w.Write(record); err == nil {
-			return nil
+			if retries > 0 && rep != nil {
+				rep.AddRetry(retries)
+			}
+			return retries, nil
 		}
 
 		if attempt == maxRetries {
 			break
 		}
 
+		retries++
 		sleep := base << attempt
 		if sleep > max {
 			sleep = max
 		}
 		jitter := time.Duration(rand.Float64() * float64(sleep) * jitterPct)
-		time.Sleep(sleep + jitter)
+		
+		// Sleep with context cancellation support
+		select {
+		case <-ctx.Done():
+			return retries, ctx.Err()
+		case <-time.After(sleep + jitter):
+		}
 	}
-	return err
+	if retries > 0 && rep != nil {
+		rep.AddRetry(retries)
+	}
+	return retries, err
 }
 
 type lockedWriter struct {
